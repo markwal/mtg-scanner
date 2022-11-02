@@ -2,36 +2,54 @@ import numpy
 import cv2
 from sympy import Line, Line2D, Point
 import pytesseract
+import logging
 
 # we're expecting a 88mm x 63mm card in the correct orientation
-_mmCardHeight = 88
+_mm_card_height = 88
 
 # section rectangles are specified in mm
-_titleSectionRect = (2.3, 4, 39.5, 6)
-_footerLine1SectionRect = (3, 82, 15, 6)
-_footerLine2SectionRect = (3, 88, 15, 6)
+_title_section_rect = (2.5, 4, 45, 6)
+_footer_line1_section_rect = (3, 82, 15, 2)
+_footer_line2_section_rect = (3, 84, 15, 2)
 
-_pxWorkingLineHeight = 185
+_px_working_line_height = 185
 
 # title dimensions in pixels within the cropped out section box
-_titleLeftMargin = 45
-_titleRightMargin = 1685
-_titleHeight = 77
+_title_left_margin = 45
+_title_height = 77
 
 
-class StraightLine(object):
+class _StraightLine(object):
     def __init__(self, point, slope):
         self.line = Line(point, slope=slope)
 
-    def getY(self, x):
+    def get_y(self, x):
         (a, b, c) = self.line.coefficients
         return (a * x + c) / -b
 
 
-class FigureArea:
-    def __init__(self, contour):
-        self.outerContour = cv2.convexHull(contour)
-        self.tightContour = contour
+class _TitleArea:
+    def __init__(self, img, px_per_mm, left_margin, height, mid_line):
+        self.img = img
+        self.px_per_mm = px_per_mm
+        self.left_margin = left_margin
+        self.title_height = height
+        self.mid_line = mid_line
+
+    def bounding_rect(self):
+        right = self.img.shape[1]
+        return (int(self.left_margin), int(self.mid_line.get_y(self.left_margin) - self.title_height / 2),
+            right - self.left_margin, int(self.mid_line.get_y(right) + self.title_height / 2))
+
+    def px_from_mm(self, mm):
+        return mm * self.px_per_mm
+
+
+class _TitleFigureArea:
+    def __init__(self, title_area, contour):
+        self.title_area = title_area
+        self.outer_contour = cv2.convexHull(contour)
+        self.tight_contour = contour
         self.box = cv2.minAreaRect(contour)
         # FUTURE there's a bunch of nonsense in the heuristics relating to the fact
         # that the height and width of that minAreaRect aren't normalized to be
@@ -41,52 +59,57 @@ class FigureArea:
     def __eq__(self, other):
         # if the outer contour is the same, close enough to not want to consider
         # separately
-        if len(self.outerContour) != len(other.outerContour):
+        if len(self.outer_contour) != len(other.outer_contour):
             return False
 
-        for i in range(0, len(self.outerContour)):
-            if not (self.outerContour[i][0] == other.outerContour[i][0]).all():
+        for i in range(0, len(self.outer_contour)):
+            if (self.outer_contour[i][0] != other.outer_contour[i][0]).any():
                 return False
 
         return True
 
-    def isOutsideTitleArea(self, titleMidLine):
-        ((x, y), (w, h), angle) = self.box
-        xApprox = int(x - w / 2)
-        yMidLine = titleMidLine.getY(xApprox)
-        return xApprox < workingTitleLeftMargin or xApprox > workingTitleRightMargin or \
-            abs(self.box[0][1] - yMidLine) > workingTitleHeight / 2
+    
+    def px_from_mm(self, mm):
+        return self.title_area.px_from_mm(mm)
 
-    def isIDot(self):
-        iDotMax = workingCardHeight / 34
-        iDotMin = workingCardHeight / 68
+
+    def is_outside_title_area(self):
+        ((x, y), (w, h), angle) = self.box
+        x_approx = int(x - w / 2)
+        y_mid_line = self.title_area.mid_line.get_y(x_approx)
+        return x_approx < _title_left_margin or abs(y - y_mid_line) > _title_height / 2
+
+
+    def is_i_dot(self):
+        i_dot_height_max = self.px_from_mm(0.6)
+        i_dot_height_min = self.px_from_mm(0.3)
 
         w, h = self.box[1]
         angle = self.box[2]
 
-        return (h < iDotMax and w < iDotMax and h > iDotMin and w > iDotMin and \
+        return (h < i_dot_height_max and w < i_dot_height_max and h > i_dot_height_min and w > i_dot_height_min and \
             angle < -50 and angle > -40)
 
 
-    def isComma(self, titleMidLine):
+    def is_comma(self):
         ((x, y), (w, h), angle) = self.box
-        if x < titleMidLine.getY(x):
+        if x < self.title_area.mid_line.get_y(x):
             return False
 
         h = max(w, h)
-        return h < workingCardHeight / 20 and h > workingCardHeight / 34
+        return h < self.px_from_mm(1) and h > self.px_from_mm(0.2)
 
 
-    def isDotLike(self, titleMidLine):
-        return self.isIDot() or self.isComma(titleMidLine)
+    def is_dot_like(self):
+        return self.is_i_dot() or self.is_comma()
 
 
-    def isDash(self, titleMidLine):
+    def is_dash(self):
         ((x, y), (w, h), angle) = self.box
 
         # is it in the middleish
-        yMid = titleMidLine.getY(x)
-        if y < yMid - workingTitleHeight / 5 or y > yMid + workingTitleHeight / 5:
+        y_mid = self.title_area.mid_line.get_y(x)
+        if y < y_mid - _title_height / 5 or y > y_mid + _title_height / 5:
             return False
 
         if angle < -45:
@@ -95,70 +118,76 @@ class FigureArea:
         # is it the shape of a dash
         if w == 0:
             return True
-        aspectRatio = h / w
-        if aspectRatio > 0.35 or aspectRatio < 0.2:
+        aspect_ratio = h / w
+        if aspect_ratio > 0.35 or aspect_ratio < 0.2:
             return False
 
         # is it the size-ish of a dash
-        return h > workingCardHeight / 170 and h < workingCardHeight / 42.5 and \
-            w > workingCardHeight / 34 and w < workingCardHeight / 8.5
+        return h > self.px_from_mm(0.5) and h < self.px_from_mm(2) and \
+            w > self.px_from_mm(0.5) and w < self.px_from_mm(2.5)
 
 
-    def isLetterSized(self):
+    def is_letter_sized(self):
         ((x, y), (w, h), angle) = self.box
         if w > h:
             w, h = h, w
 
-        return w > workingCardHeight / 52.3 and w < workingCardHeight / 5.9 and \
-            h > workingCardHeight / 22.65 and h < workingCardHeight / 5.9
+        is_letter_sized = w > self.px_from_mm(0.1) and w < self.px_from_mm(4) and \
+            h > self.px_from_mm(1.5) and h < self.px_from_mm(4)
+        return is_letter_sized
 
 
-    def isNoise(self, titleMidLine):
-        return self.isDotLike(titleMidLine) or self.isDash(titleMidLine) or \
-                not self.isLetterSized() or self.isOutsideTitleArea(titleMidLine)
+    def is_noise(self):
+        ((_, _), (w, h), _) = self.box
+        if w > h:
+            w, h = h, w
+        
+        if (h > self.px_from_mm(2)):
+            logging.info(f'{self.is_dot_like()}, {self.is_dash()}, {self.is_letter_sized()}, {self.is_outside_title_area()}')
+
+        return self.is_dot_like() or self.is_dash() or \
+                not self.is_letter_sized() or self.is_outside_title_area()
 
 
-    def isContainedWithin(self, figure):
+    def is_contained_within(self, figure):
         # seems like this should be intersection of self and figure equivalent to self?
         # this approx logic is from CardReaderLibrary, perhaps the intersection method
         # is too slow?
 
         # if this center is outside the figure's convex hull then definitely not contained
-        if cv2.pointPolygonTest(figure.outerContour, self.box[0], False) <= 0:
+        if cv2.pointPolygonTest(figure.outer_contour, self.box[0], False) <= 0:
             return False
 
         # if this center is inside and the area is smaller, good enough to discard
-        return cv2.contourArea(self.outerContour) < cv2.contourArea(figure.outerContour)
+        return cv2.contourArea(self.outer_contour) < cv2.contourArea(figure.outer_contour)
 
 
     # if self is entirely contained in one of the other figures (except itself)
     # then we can throw it out
-    def isLetterHole(self, figures):
+    def is_letter_hole(self, figures):
         # print("self is figure", list(map(lambda figure: self is figure, figures)))
         # return any(map(lambda figure: not self is figure and self.isContainedWithin(figure), figures))
         for figure in figures:
-            if self.isContainedWithin(figure):
+            if self.is_contained_within(figure):
                 return True
         return False
 
 
-def _RemoveDuplicatesFromSorted(inList):
-    outList = []
+def remove_dups_from_sorted(in_list):
+    out_list = []
 
-    if len(inList) == 0:
-        return outList
+    if len(in_list) == 0:
+        return out_list
 
-    outList.append(inList[0])
+    out_list.append(in_list[0])
 
-    for item in inList[1:]:
-        if item != outList[-1]:
-            outList.append(item)
+    for item in in_list[1:]:
+        if item != out_list[-1]:
+            out_list.append(item)
         else:
-            print("item: ", item.outerContour)
-            print("outList[-1]: ", outList[-1].outerContour)
-            print("skip")
+            logging.info(f'skip item: {item.outer_contour}, out_list[-1]: {out_list[-1].outer_contour}')
 
-    return outList
+    return out_list
 
 
 # from CardReaderLibrary which says it is sorting by the left border, but this code ignores the rotation angle
@@ -170,127 +199,135 @@ def _FigureAreaSort(area):
 
 
 class StraightCard:
-    def __init__(self, image, cardType):
+    def __init__(self, image, card_type, save_debug_images):
         self.image = image
-        self.cardType = cardType
+        self.card_type = card_type
+        self.save_debug_images = save_debug_images
 
 
-    def _PxRectFromMm(self, rect):
+    def _px_rect_from_mm(self, rect):
         (x, y, w, h) = rect
         (hpx, wpx, dcolors) = self.image.shape
-        factor = hpx / _mmCardHeight
+        factor = hpx / _mm_card_height
 
         return (int(x * factor), int(y * factor), int(w * factor), int(h * factor))
 
 
-    def _ScaleSectionRect(self, rect, size):
+    def _scale_section_rect(self, rect, size):
         (x, y, w, h) = rect   # rectangle in 0 to 1 coordinates
         (hpx, wpx, dcolors) = size     # pixel height and width of the total area
 
         return (int(x * wpx), int(y * hpx), int(w * wpx), int(h * hpx))  # section rect in pixel coordinates
 
 
-    def _GetNormalTitleSectionRect(self, size):
-        return self._ScaleSectionRect((0.037, 0.045, 0.62839, 0.068), size)
+    def _save_debug_image(self, fn, img):
+        if self.save_debug_images:
+            cv2.imwrite(fn, img)
 
 
-    def ReadTitle(self, threshold):
+    def _extract_and_prep_line(self, line_name, threshold, rect, invert=False):
         # crop the title title out
-        x, y, w, h = self._PxRectFromMm(_titleSectionRect)
+        x, y, w, h = self._px_rect_from_mm(rect)
         img = self.image[y:y+h, x:x+w].copy()
-        print('crop dims:', img.shape)
-        cv2.imwrite("test-1-crop.png", img)
+        logging.info(f'Extracted {line_name} dimensions: {img.shape}')
+        self._save_debug_image(f'{line_name}-1-crop.png', img)
 
         # grayscale
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite("test-2-grayscale.png", img)
+        if invert:
+            img = ~img
+        self._save_debug_image(f'{line_name}-2-grayscale.png', img)
 
         # scale to working resolution
-        w, h, d = img.shape
-        img = cv2.resize(img, (int(h * _pxWorkingLineHeight / w), _pxWorkingLineHeight))
-        cv2.imwrite("test-3-workingres.png", img)
+        h, w, *_ = img.shape
+        img = cv2.resize(img, (int(w * _px_working_line_height / h), _px_working_line_height))
+        logging.info(f'resized to {img.shape}, hoping for {_px_working_line_height}')
+        self._save_debug_image(f'{line_name}-3-workingres.png', img)
 
         # blur image to smooth out scanning artifacts in the title background
         img = cv2.GaussianBlur(img, (3, 3), 0)
-        cv2.imwrite("test-4-blurred.png", img)
+        self._save_debug_image(f'{line_name}-4-blurred.png', img)
 
         # threshold to monochrome
         ret, img = cv2.threshold(img, threshold, 255, cv2.THRESH_BINARY)
-        cv2.imwrite("test-5-threshold.png", img)
+        self._save_debug_image(f'{line_name}-5-threshold.png', img)
+
+        return img
+
+
+    def read_title(self, threshold):
+        img = self._extract_and_prep_line("dbg-1-title", threshold, _title_section_rect)
 
         # find the letter contours
         edges = cv2.Canny(img, 120, 240, apertureSize=3)
-        cv2.imwrite("test-6-canny.png", edges)
+        self._save_debug_image("dbg-2-canny.png", edges)
         contours, hierarchy = cv2.findContours(edges, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) # back to color so we can draw on it
 
-        # save the contours as a list of FirgureArea's and remove dups
-        figures = list(map(lambda figure: FigureArea(figure), contours))
-        print("# of figures: ", len(figures))
+        # save the contours as a list of TitleFigureArea's and remove dups
+        mid_line = _StraightLine(Point(0, _px_working_line_height/2), slope=0)  # REVIEW seems wrong
+        px_per_mm = img.shape[0] / _title_section_rect[3] # extract height in pixels / height in mm
+        logging.info(f'px_per_mm: {px_per_mm}, img height: {img.shape[0]}, img height in mm: {_title_section_rect[3]}')
+        title_area = _TitleArea(img, px_per_mm, _title_left_margin, _title_height, mid_line)
+        figures = list(map(lambda figure: _TitleFigureArea(title_area, figure), contours))
+        logging.info(f'Detected {len(figures)} figures in the title area.')
         figures.sort(key = _FigureAreaSort)
-        figures = _RemoveDuplicatesFromSorted(figures)
-        print("# of figures after remove dups: ", len(figures))
+        figures = remove_dups_from_sorted(figures)
+        logging.info(f'After removing duplicates: {len(figures)}')
 
         # filter out the noisy contours
-        baseLine = midLine = StraightLine(Point(0, workingTitleHeight), slope=0)
-        figures = list(filter(lambda figure: not figure.isNoise(midLine), figures))
-        print("# of figures after noise filter: ", len(figures))
-        contours = list(map(lambda figure: figure.outerContour, figures))
-        imgContours = cv2.drawContours(img.copy(), contours, -1, (0,0,255), 2)
-        imgContours = cv2.rectangle(imgContours, 
-            (int(workingTitleLeftMargin), int(midLine.getY(workingTitleLeftMargin) - workingTitleHeight / 2)),
-            (int(workingTitleRightMargin), int(midLine.getY(workingTitleRightMargin) + workingTitleHeight / 2)),
-            (0,255,0), 2)
-        cv2.imwrite("test-7-contours.png", imgContours)
+        figures = list(filter(lambda figure: not figure.is_noise(), figures))
+        logging.info(f'After filtering noise: {len(figures)}')
+        if len(figures) == 0:
+            return ''
+        contours = list(map(lambda figure: figure.outer_contour, figures))
+        if self.save_debug_images:
+            # draw the contours
+            img_contours = cv2.drawContours(img.copy(), contours, -1, (0,0,255), 2)
+            # draw the approximate bounding rectangle, FUTURE at midLine slope
+            x, y, w, h = title_area.bounding_rect()
+            img_contours = cv2.rectangle(img_contours, (x, y), (x + w, y + h), (0,255,0), 2)
+            self._save_debug_image("dbg-3-contours.png", img_contours)
 
         # filter out the contours that are contained within the letters
-        figuresIn = figures
+        figures_in = figures
         figures = []
-        for i in range(0, len(figuresIn)):
+        for i in range(0, len(figures_in)):
             neighbors = figures[-1:]
-            neighbors.extend(figuresIn[i+1:i+2])
-            if not figuresIn[i].isLetterHole(neighbors):
-                figures.append(figuresIn[i])
-        figuresIn = []
-        print("# of figures after hole filter: ", len(figures))
+            neighbors.extend(figures_in[i+1:i+2])
+            if not figures_in[i].is_letter_hole(neighbors):
+                figures.append(figures_in[i])
+        figures_in = []
+        logging.info(f'After filtering out interiors: {len(figures)}')
 
         # find the straight bounding rectangle of the figures we've found
         x, y, w, h = cv2.boundingRect(numpy.concatenate(contours))
 
         # draw the contours on an image and save the result
-        contours = list(map(lambda figure: figure.outerContour, figures))
-        imgContours = cv2.drawContours(img.copy(), contours, -1, (255,0,255), 2)
-        imgContours = cv2.rectangle(imgContours, (x, y), (x + w, y + h), (0,255,0), 2)
-        cv2.imwrite("test-8-contours.png", imgContours)
+        contours = list(map(lambda figure: figure.outer_contour, figures))
+        img_contours = cv2.drawContours(img.copy(), contours, -1, (255,0,255), 2)
+        img_contours = cv2.rectangle(img_contours, (x, y), (x + w, y + h), (0,255,0), 2)
+        self._save_debug_image("dbg-4-contours.png", img_contours)
 
         # Now that we've got the bounding box of the letters, crop it out
         img = img[y:y+h, x:x+w].copy()
-        print('tight crop dims:', img.shape)
-        cv2.imwrite("test-9-tight-crop.png", img)
+        logging.info(f'tight crop dims: {img.shape}')
+        self._save_debug_image("dbg-5-tight-crop.png", img)
 
         title = pytesseract.image_to_string(img, config=r'--psm 7')
-        print("card title: ", title)
+        logging.info(f'card title: {title}')
+        return title
 
 
-    def readSetAndCardNumber(self):
-        # grab the original image and scale it down to working rez
-        img = cv2.resize(inImage, (int(workingFooterCardHeight * inImage.shape[1] / inImage.shape[0]), workingFooterCardHeight))
+    def read_set_code(self):
+        img = self._extract_and_prep_line("dbg-6-set", 140, _footer_line2_section_rect, invert=True)
+        set = pytesseract.image_to_string(img, config=r'--psm 7')
+        logging.info(f'set: {set}')
+        return set
 
-        # crop out the footer section
-        x = workingFooterLeftMargin
-        y = workingFooterTopMargin
-        img = img[y:y+workingFooterCropHeight, x:x+workingFooterCropWidth].copy()
-        cv2.imwrite("test-footer-1-crop.png", img)
 
-        # grayscale then threshold
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        img = ~img
-        img = cv2.GaussianBlur(img, (3, 3), 0)
-        cv2.imwrite("test-footer-2-invert.png", img)
-        ret,img = cv2.threshold(img, 140, 255, cv2.THRESH_BINARY)
-        cv2.imwrite("test-footer-3-threshold.png", img)
-
-image = cv2.imread("test.png")
-print('dimensions', image.shape)
-ReadTitleOfStraightCard(image, 120, 1)
-
+    def read_collector_number(self):
+        img = self._extract_and_prep_line("dbg-7-cnc", 140, _footer_line1_section_rect, invert=True)
+        collector = pytesseract.image_to_string(img, config=r'--psm 7')
+        logging.info(f'set: {set}')
+        return collector
