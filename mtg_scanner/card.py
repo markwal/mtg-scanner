@@ -1,6 +1,5 @@
 import numpy
 import cv2
-from sympy import Line, Line2D, Point
 import pytesseract
 import logging
 
@@ -9,8 +8,8 @@ _mm_card_height = 88
 
 # section rectangles are specified in mm
 _title_section_rect = (2.5, 4, 45, 6)
-_footer_line1_section_rect = (3, 82, 15, 2)
-_footer_line2_section_rect = (3, 84, 15, 2)
+_footer_line1_section_rect = (3, 82, 10, 2)
+_footer_line2_section_rect = (3, 84, 4.2, 2)
 
 _px_working_line_height = 185
 
@@ -21,11 +20,12 @@ _title_height = 77
 
 class _StraightLine(object):
     def __init__(self, point, slope):
-        self.line = Line(point, slope=slope)
+        x, y = point
+        self.m = slope
+        self.b = y - slope * x
 
     def get_y(self, x):
-        (a, b, c) = self.line.coefficients
-        return (a * x + c) / -b
+        return int(self.m * x + self.b)
 
 
 class _TitleArea:
@@ -141,9 +141,9 @@ class _TitleFigureArea:
         ((_, _), (w, h), _) = self.box
         if w > h:
             w, h = h, w
-        
-        if (h > self.px_from_mm(2)):
-            logging.info(f'{self.is_dot_like()}, {self.is_dash()}, {self.is_letter_sized()}, {self.is_outside_title_area()}')
+
+#        if (h > self.px_from_mm(2)):
+#            logging.info(f'{self.is_dot_like()}, {self.is_dash()}, {self.is_letter_sized()}, {self.is_outside_title_area()}')
 
         return self.is_dot_like() or self.is_dash() or \
                 not self.is_letter_sized() or self.is_outside_title_area()
@@ -241,7 +241,6 @@ class StraightCard:
         # scale to working resolution
         h, w, *_ = img.shape
         img = cv2.resize(img, (int(w * _px_working_line_height / h), _px_working_line_height))
-        logging.info(f'resized to {img.shape}, hoping for {_px_working_line_height}')
         self._save_debug_image(f'{line_name}-3-workingres.png', img)
 
         # blur image to smooth out scanning artifacts in the title background
@@ -265,7 +264,7 @@ class StraightCard:
         img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) # back to color so we can draw on it
 
         # save the contours as a list of TitleFigureArea's and remove dups
-        mid_line = _StraightLine(Point(0, _px_working_line_height/2), slope=0)  # REVIEW seems wrong
+        mid_line = _StraightLine((0, _px_working_line_height/2), slope=0)  # REVIEW seems wrong
         px_per_mm = img.shape[0] / _title_section_rect[3] # extract height in pixels / height in mm
         logging.info(f'px_per_mm: {px_per_mm}, img height: {img.shape[0]}, img height in mm: {_title_section_rect[3]}')
         title_area = _TitleArea(img, px_per_mm, _title_left_margin, _title_height, mid_line)
@@ -284,10 +283,13 @@ class StraightCard:
         if self.save_debug_images:
             # draw the contours
             img_contours = cv2.drawContours(img.copy(), contours, -1, (0,0,255), 2)
-            # draw the approximate bounding rectangle, FUTURE at midLine slope
+            # draw the approximate bounding rectangle, FUTURE at mid_line slope
             x, y, w, h = title_area.bounding_rect()
-            img_contours = cv2.rectangle(img_contours, (x, y), (x + w, y + h), (0,255,0), 2)
+            img_contours = cv2.rectangle(img_contours, (x, y), (w, h), (0,255,0), 2)
+            # draw mid_line
+            img_contours = cv2.line(img_contours, (x, mid_line.get_y(x)), (x + w, mid_line.get_y(x + w)), (255,0,0), 2)
             self._save_debug_image("dbg-3-contours.png", img_contours)
+
 
         # filter out the contours that are contained within the letters
         figures_in = figures
@@ -314,20 +316,20 @@ class StraightCard:
         logging.info(f'tight crop dims: {img.shape}')
         self._save_debug_image("dbg-5-tight-crop.png", img)
 
-        title = pytesseract.image_to_string(img, config=r'--psm 7')
+        title = pytesseract.image_to_string(img, config=r'--psm 7').split('\n')[0]
         logging.info(f'card title: {title}')
         return title
 
 
     def read_set_code(self):
         img = self._extract_and_prep_line("dbg-6-set", 140, _footer_line2_section_rect, invert=True)
-        set = pytesseract.image_to_string(img, config=r'--psm 7')
-        logging.info(f'set: {set}')
-        return set
+        set = pytesseract.image_to_string(img, config=r'--psm 7').split()
+        logging.info(f'set: {ascii(set)}')
+        return set[0] if len(set) > 0 else ''
 
 
     def read_collector_number(self):
         img = self._extract_and_prep_line("dbg-7-cnc", 140, _footer_line1_section_rect, invert=True)
-        collector = pytesseract.image_to_string(img, config=r'--psm 7')
-        logging.info(f'set: {set}')
-        return collector
+        collector = pytesseract.image_to_string(img, config=r'--psm 7').split()
+        logging.info(f'collector: {ascii(collector)}')
+        return collector[0] if len(collector) > 0 else ''
