@@ -6,7 +6,7 @@ import logging
 @click.command()
 
 @click.argument('image', nargs=-1, type=click.Path(exists=True))
-@click.option('-o', '--output', type=click.Path())
+@click.option('-o', '--output', type=click.File('w'), default='-')
 @click.option('--debug/--nodebug', default=False)
 
 def main(image, output, debug):
@@ -22,15 +22,7 @@ def main(image, output, debug):
             continue
 
         c = card.StraightCard(img, card_type=None, save_debug_images=debug)
-        print(f'filename:       {fn}')
-#        print(f'read_title 120: {c.read_title(120)}')
-        print(f'read_title 90:  {c.read_title(90)}')
-        print(f'read_set_code:  {c.read_set_code()}')
-        print(f'read_collector: {c.read_collector_number()}')
-
-    if output:
-        print(f'output filename: {output}')
-        output.write("hello\n")
+        print(f'1 {c.read_title(90)} ({c.read_set_code()}) {c.read_collector_number()}', file=output)
 
 if __name__ == '__main__':
     main()

@@ -78,7 +78,7 @@ try:
         packages={"mtg_scanner"},  # Required
 
         python_requires=">=3.7, <4",
-        install_requires=["pytesseract", "numpy", "sympy", "opencv-python", "click"],  # Optional
+        install_requires=["pytesseract", "numpy", "requests", "opencv-python", "click"],  # Optional
         # List additional groups of dependencies here (e.g. development
         # dependencies). Users will be able to install these using the "extras"
         # syntax, for example:
